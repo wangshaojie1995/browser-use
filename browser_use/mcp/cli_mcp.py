@@ -30,7 +30,13 @@ from mcp.server import Server
 
 import browser_use
 from browser_use import Browser, harness_cloud
-from browser_use.auth import browser_use_api_key, harden_login_callback, set_aside_corrupt_store
+from browser_use.auth import (
+	browser_use_api_key,
+	harden_login_callback,
+	login_outcome,
+	record_auth_event,
+	set_aside_corrupt_store,
+)
 from browser_use.browser.browser import _name_daemon_files
 from browser_use.domains import DomainRules
 from browser_use.exceptions import removed
@@ -39,6 +45,7 @@ from browser_use.repl.capture import install as install_capture
 from browser_use.repl.page_info import install as install_page_info
 from browser_use.repl.session import MAX_OUTPUT_CHARS, clip
 from browser_use.telemetry import feedback
+from browser_use.telemetry.auth_events import set_entry
 from browser_use.update_check import upgrade_hint
 from browser_use.utils import get_browser_use_version
 
@@ -63,6 +70,17 @@ OLD_TOOLS = {  # the 0.x browser-use --mcp server's tools (it ran the removed en
 OLD_TOOL_HINT = 'browser_exec runs Python with the browser-harness helpers (goto_url, click_at_xy, js, list_tabs, ...).'
 CLOUD_TIMEOUT_MINUTES = 30  # default lifetime of a cloud browser this server starts; start_remote_daemon(timeout=) overrides
 INSTALL_TIMEOUT_S = 600  # Playwright's Chromium (~150 MB) and, as root on Linux, its system libraries
+# browser_exec replies within this: Cursor and the other clients on the MCP TypeScript SDK cancel a tool call at 60 s, and
+# the model then got nothing back from code that ran on
+CALL_SECONDS = 50.0
+STILL_RUNNING = (
+	'Still running after {seconds:.0f} s, so this reply comes before the MCP client gives up on the call; the code keeps '
+	'running. Call browser_exec with code "" to wait for it and get the rest of its output (new code would run beside it).'
+)
+NOTHING_RUNNING = 'Nothing is running: every earlier browser_exec has ended and returned all of its output.'
+BUSY = (
+	f'Not run: an earlier browser_exec or browser_screenshot call still held the browser after {CALL_SECONDS:.0f} s. Call again.'
+)
 NO_CLOUD_WITH_DOMAINS = (
 	"{name}() is off: this server's allowed_domains / prohibited_domains hold only on its own Chromium, and a cloud "
 	'browser would open any site'
@@ -146,6 +164,13 @@ _call_errors: contextvars.ContextVar[list[tuple[str, str]] | None] = contextvars
 TOOLS = ('browser_exec', 'browser_screenshot', 'browser_login', 'browser_feedback')
 
 
+def _count(kind: str) -> None:
+	"""Telemetry for the tool call in progress: why browser_exec replied before its code ended, or failed without an
+	exception of its own. No text: an earlier cell's output can hold page data."""
+	if (errors := _call_errors.get()) is not None:
+		errors.append((kind, ''))
+
+
 def _client_gone(e: BaseException) -> bool:
 	"""Writing to the client failed because it closed its end of the pipe: it quit, or gave up waiting for a reply (a
 	slow first start). Windows can report that as EINVAL instead of EPIPE (CPython bpo-35754)."""
@@ -221,17 +246,17 @@ def _no_chrome_here() -> str | None:
 
 CHROME_SETUP = (
 	'your Chrome has remote debugging off. For your Chrome with its tabs and logins: in Chrome open '
-	'chrome://inspect/#remote-debugging, tick "Allow remote debugging for this browser instance", then restart this MCP '
-	'server'
+	'chrome://inspect/#remote-debugging, tick "Allow remote debugging for this browser instance", then call '
+	'use_my_chrome()'
 )
 
 
-def _setup_reason(e: RuntimeError, then: str = 'restart this MCP server') -> str:
+def _setup_reason(e: RuntimeError, then: str = 'call use_my_chrome()') -> str:
 	"""Why --cli-mcp (or the CLI: then='run `browser-use --reload`') runs its own Chromium after the chrome://inspect
 	setup failed, and how to get the user's Chrome."""
 	text = str(e).removeprefix('remote-debugging-setup:').strip()
 	if text.startswith('none of your browsers'):
-		return CHROME_SETUP.replace('restart this MCP server', then)
+		return CHROME_SETUP.replace('call use_my_chrome()', then)
 	return f'{text.rstrip(".").removesuffix(", then run again")}, then {then}'
 
 
@@ -323,6 +348,37 @@ def _capture(buffer: StringIO):
 		_cell.buffer = None
 
 
+class _Cell:
+	"""One browser_exec cell on its own thread, which no call can stop. One that outlives its call (CALL_SECONDS, or a
+	client that cancelled sooner) keeps running: later calls return what it prints from then on, and its end."""
+
+	def __init__(self) -> None:
+		self.buffer = StringIO()
+		self.started = time.monotonic()
+		self.failed = True
+		self.done = threading.Event()
+		self._shown = 0
+
+	def new_output(self) -> str:
+		"""What it printed since the last call returned its output."""
+		text = self.buffer.getvalue()
+		text, self._shown = text[self._shown :], len(text)
+		return text
+
+
+def _clipped(output: str) -> str:
+	"""The agent's cap on a cell's output (MAX_OUTPUT_CHARS); the full text stays readable on disk."""
+	if len(output) <= MAX_OUTPUT_CHARS:
+		return output
+	# utf-8: Windows' locale encoding (cp1252) failed the whole call on an emoji, after the cell ran; newline='': the file
+	# holds the output as captured (Windows wrote each \n as \r\n)
+	with tempfile.NamedTemporaryFile(
+		'w', encoding='utf-8', errors='replace', newline='', prefix='browser_exec_', suffix='.txt', delete=False
+	) as f:
+		f.write(output)
+	return clip(output, f.name)
+
+
 def _open_url(url: str) -> bool:
 	"""Open url in the user's browser without letting a child process write to stdout (the MCP channel)."""
 	command = {'darwin': ['open', url], 'linux': ['xdg-open', url]}.get(sys.platform)
@@ -339,7 +395,8 @@ def _open_url(url: str) -> bool:
 
 
 class _Login:
-	"""One browser OAuth login (browser-harness's flow and key store), finishing in a thread across tool calls."""
+	"""One browser OAuth login (browser-harness's flow and key store), finishing in a thread across tool calls. Sends
+	library_auth login_started, then login_succeeded or login_failed (entry mcp)."""
 
 	def __init__(self):
 		from browser_harness import auth
@@ -347,7 +404,12 @@ class _Login:
 		os.environ.setdefault('BH_DEVICE_NAME', 'browser-use-mcp')
 		harden_login_callback()
 		set_aside_corrupt_store()  # a corrupt key store would make saving the new key fail after the user approved
-		self.start = auth.start_browser_auth(open_url=False)
+		record_auth_event('login_started', method='browser', entry='mcp')
+		try:
+			self.start = auth.start_browser_auth(open_url=False)
+		except Exception as e:
+			record_auth_event('login_failed', method='browser', entry='mcp', outcome=login_outcome(e))
+			raise
 		self.opened = _open_url(self.start.auth_url)
 		self.error: str | None = None
 		self.thread = threading.Thread(target=self._finish, daemon=True, name='browser-use-login')
@@ -360,6 +422,9 @@ class _Login:
 			auth.complete_browser_auth(self.start)
 		except Exception as e:  # AuthError: denied, timed out, exchange failed
 			self.error = str(e)
+			record_auth_event('login_failed', method='browser', entry='mcp', outcome=login_outcome(e))
+		else:
+			record_auth_event('login_succeeded', method='browser', entry='mcp')
 
 
 def _refusing(fn: Any, rules: DomainRules) -> Any:
@@ -421,6 +486,8 @@ class CLIMCPServer:
 		self._installed: float | None = None  # seconds _install_chromium took, until announced
 		self._announced: str | None = None  # the browser the last browser_exec result named
 		self._note: str | None = None  # the browser now in use, for the next browser_exec result's second block
+		self._switched = False  # the next browser note says the server left its own Chromium for the user's Chrome
+		self._hinted = False  # use_my_chrome() was suggested once for the current fallback
 		self.server: Server = Server(
 			'browser-use',
 			version=get_browser_use_version(),
@@ -428,12 +495,16 @@ class CLIMCPServer:
 		)
 		self._namespace: dict[str, Any] | None = None
 		self._exec_lock = asyncio.Lock()
+		self._running: list[_Cell] = []  # cells that outlived their call, oldest first
 		self._login: _Login | None = None
 		self._login_lock = threading.Lock()
 		# _attach from a cell the client gave up on and from the next call: one Browser.start() at a time (its asyncio
 		# lock binds to one event loop, and each thread runs its own)
 		self._attach_lock = threading.Lock()
 		self._remote = f'mcp-{os.getpid()}'  # this server's cloud daemon name: no other server or CLI shares it
+		from browser_harness import admin
+
+		self._base = admin.NAME  # the daemon of the user's Chrome; routing to the own Chromium changes admin.NAME
 		# set once start_remote_daemon ran here; not the .cloud marker, which an earlier server with this pid may have left
 		self._cloud_started = False
 		self._reapers: list[subprocess.Popen] = []  # held open so the pipes close only when this process exits
@@ -453,13 +524,18 @@ class CLIMCPServer:
 					'should be new_tab(url). Drives the local Chrome (the first result names it) until '
 					'start_remote_daemon() starts a cloud browser; then every call drives that one until it ends '
 					'(stopped when this server exits). '
+					f'A call replies within {CALL_SECONDS:.0f} s: code still running then keeps running, and '
+					'browser_exec with code "" waits for it and returns the rest of its output. '
 					"A cloud browser's downloads stay on the remote host, never in ~/Downloads (a file there is not its "
 					'download): GET https://api.browser-use.com/api/v4/browsers/{id}/downloads lists them.'
 				),
 				input_schema={
 					'type': 'object',
 					'properties': {
-						'code': {'type': 'string', 'description': 'Python code to execute'},
+						'code': {
+							'type': 'string',
+							'description': 'Python code to execute; "" waits for code an earlier call left running',
+						},
 					},
 					'required': ['code'],
 				},
@@ -508,38 +584,26 @@ class CLIMCPServer:
 			errors: list[tuple[str, str]] = []
 			token = _call_errors.set(errors)
 			started, result = time.monotonic(), None
+			call: dict[str, str] = {}  # this call's login_state: overlapping calls share the server
 			try:
-				result = await call_tool(params.name, params.arguments or {})
+				result = await call_tool(params.name, params.arguments or {}, call)
 				return result
 			except BaseException as e:  # a cancelled call (the client's timeout): CancelledError
 				_error_class(e)
 				raise
 			finally:
 				_call_errors.reset(token)
-				self._record_call(params.name, result, errors, time.monotonic() - started)
+				self._record_call(params.name, result, errors, time.monotonic() - started, call.get('login_state'))
 
-		async def call_tool(name: str, arguments: dict[str, Any]) -> types.CallToolResult:
+		async def call_tool(name: str, arguments: dict[str, Any], call: dict[str, str]) -> types.CallToolResult:
 			if name == 'browser_exec':
 				code = arguments.get('code')
-				if not isinstance(code, str) or not code.strip():
+				if not isinstance(code, str):
 					return types.CallToolResult(
-						content=[types.TextContent(type='text', text="Error: 'code' must be a non-empty string")],
+						content=[types.TextContent(type='text', text="Error: 'code' must be a string")],
 						is_error=True,
 					)
-				output, failed = await self._locked(self._execute, code)
-				note, self._note = self._note, None
-				if len(output) > MAX_OUTPUT_CHARS:  # same cap as the agent's cells; the full text stays readable on disk
-					# utf-8: Windows' locale encoding (cp1252) failed the whole call on an emoji, after the cell ran; newline='':
-					# the file holds the output as captured (Windows wrote each \n as \r\n)
-					with tempfile.NamedTemporaryFile(
-						'w', encoding='utf-8', errors='replace', newline='', prefix='browser_exec_', suffix='.txt', delete=False
-					) as f:
-						f.write(output)
-					output = clip(output, f.name)
-				content = [types.TextContent(type='text', text=output or '(no output)')]
-				if note:  # its own block: a client that parses the code's output (JSON) gets only that in the first
-					content.append(types.TextContent(type='text', text=note))
-				return types.CallToolResult(content=content, is_error=failed)
+				return await self._exec_call(code)
 			if name == 'browser_screenshot':
 				max_dim = arguments.get('max_dim')
 				if max_dim is not None and (isinstance(max_dim, bool) or not isinstance(max_dim, int) or max_dim < 1):
@@ -555,8 +619,9 @@ class CLIMCPServer:
 				content: list[types.ContentBlock] = [types.ImageContent(type='image', data=png, mime_type='image/png')]
 				return types.CallToolResult(content=content)
 			if name == 'browser_login':
-				text = await asyncio.to_thread(self._sign_in, bool(arguments.get('force', False)))
-				return types.CallToolResult(content=[types.TextContent(type='text', text=text)])
+				text, call['login_state'] = await asyncio.to_thread(self._sign_in, bool(arguments.get('force', False)))
+				failed = call['login_state'] in ('failed', 'start_failed')  # ok=True always made a failed login invisible
+				return types.CallToolResult(content=[types.TextContent(type='text', text=text)], is_error=failed)
 			if name == 'browser_feedback':
 				text, failed = feedback.mcp_call(arguments)
 				return types.CallToolResult(content=[types.TextContent(type='text', text=text)], is_error=failed)
@@ -569,7 +634,14 @@ class CLIMCPServer:
 		self.server.add_request_handler('tools/list', types.PaginatedRequestParams, handle_list_tools)
 		self.server.add_request_handler('tools/call', types.CallToolRequestParams, handle_call_tool)
 
-	def _record_call(self, name: str, result: types.CallToolResult | None, errors: list[tuple[str, str]], seconds: float) -> None:
+	def _record_call(
+		self,
+		name: str,
+		result: types.CallToolResult | None,
+		errors: list[tuple[str, str]],
+		seconds: float,
+		login_state: str | None = None,
+	) -> None:
 		"""One mcp_server_event per tool call: queued, sent by the telemetry thread; never fails a call."""
 		self._calls += 1
 		try:
@@ -581,7 +653,9 @@ class CLIMCPServer:
 
 			if not telemetry().enabled:
 				return
-			if not errors and result is not None and result.is_error:  # no exception: rejected arguments, an unknown tool
+			if not errors and result is not None and result.is_error and name == 'browser_login':
+				errors = [('login_failed', '')]  # login_state is the reason: the text quotes the auth server's own
+			elif not errors and result is not None and result.is_error:  # no exception: rejected arguments, an unknown tool
 				text = next((c.text for c in result.content if isinstance(c, types.TextContent)), '') if name in TOOLS else ''
 				errors = [('invalid_arguments' if name in TOOLS else 'unknown_tool', text.removeprefix('Error: '))]
 			detect = getattr(harness_telemetry, '_detect_agent_client', None)
@@ -597,10 +671,74 @@ class CLIMCPServer:
 				call_n=self._calls,
 				is_internal=is_internal(),
 				error_message=scrub(errors[0][1], [], MAX_ERROR) or None if errors else None,
+				login_state=login_state if name == 'browser_login' else None,
 			)
 			telemetry().capture(event)
 		except Exception:  # - telemetry never breaks a tool call
 			pass
+
+	async def _exec_call(self, code: str) -> types.CallToolResult:
+		"""browser_exec: run code on its own thread (empty code: wait for the cells still running) and reply within
+		CALL_SECONDS whether it ended or not. One call at a time: a call that cannot start before its deadline does not run."""
+		deadline = time.monotonic() + CALL_SECONDS
+		try:
+			async with asyncio.timeout(max(0.0, deadline - time.monotonic())):
+				await self._exec_lock.acquire()
+		except TimeoutError:
+			_count('busy')
+			return types.CallToolResult(content=[types.TextContent(type='text', text=BUSY)], is_error=True)
+		try:
+			return await self._exec_reply(code, deadline)
+		finally:
+			self._exec_lock.release()
+
+	async def _exec_reply(self, code: str, deadline: float) -> types.CallToolResult:
+		"""The first block is the code's own output (a client may parse it as JSON); then whether it still runs, what
+		earlier cells printed since and how they ended, and the browser note."""
+		earlier = list(self._running)
+		cell = None
+		if code.strip():
+			cell = _Cell()
+			self._running.append(cell)
+			run = contextvars.copy_context().run  # its failures go to this call's telemetry
+			threading.Thread(target=run, args=(self._run_cell, cell, code), daemon=True, name='browser-exec').start()
+		waited = [cell] if cell else earlier
+		await asyncio.to_thread(lambda: [c.done.wait(max(0.0, deadline - time.monotonic())) for c in waited])
+		blocks, failed = [], False
+		if cell is not None:
+			blocks.append(_clipped(cell.new_output()) or '(no output)')
+			if cell.done.is_set():
+				self._running.remove(cell)
+				failed = cell.failed
+			else:
+				blocks.append(STILL_RUNNING.format(seconds=time.monotonic() - cell.started))
+				_count('still_running')
+		elif not earlier:
+			blocks.append(NOTHING_RUNNING)
+		for c in earlier:
+			seconds = time.monotonic() - c.started
+			if c.done.is_set():  # before reading its output: an ended cell's output is complete
+				self._running.remove(c)
+				head = f'[earlier browser_exec {"failed" if c.failed else "ended"} after {seconds:.0f} s]'
+				if cell is None and c.failed:  # the wait's result is that failure; telemetry gets no text of it
+					failed = True
+					_count('earlier_failed')
+			else:
+				head = f'[earlier browser_exec still running ({seconds:.0f} s)]'
+				if cell is None:
+					_count('still_running')
+			output = _clipped(c.new_output())
+			blocks.append(f'{head}\n{output}' if output else head)
+		note, self._note = self._note, None
+		if note:
+			blocks.append(note)
+		return types.CallToolResult(content=[types.TextContent(type='text', text=b) for b in blocks], is_error=failed)
+
+	def _run_cell(self, cell: _Cell, code: str) -> None:
+		try:
+			_, cell.failed = self._execute(code, buffer=cell.buffer)
+		finally:
+			cell.done.set()
 
 	async def _locked(self, fn: Any, *args: Any) -> Any:
 		"""fn(*args) in a thread, one at a time. A call the client cancels (its timeout) lets go of the lock at once: its
@@ -620,6 +758,8 @@ class CLIMCPServer:
 			harness_cloud.install(ns)
 			ns['start_remote_daemon'] = self._start_remote
 			ns['stop_remote_daemon'] = lambda name=None: harness_cloud.stop(self._remote)
+			if not self._own_browser:
+				ns['use_my_chrome'] = self._use_my_chrome
 			rules = self._browser.domains if self._browser is not None else None  # --mcp with a 0.x config's domains
 			if rules:
 				for name in ('new_tab', 'goto_url'):
@@ -644,6 +784,15 @@ class CLIMCPServer:
 		use and starts its daemon again if that died."""
 		if self._cloud_started:
 			return harness_cloud.ensure_daemon()
+		if self._user_chrome_back():
+			if not self._own_pages():  # nothing the agent works on in the temp browser: leave it now
+				return self._leave_own()
+			if not self._hinted:
+				self._hinted = True
+				self._note = (
+					'Your Chrome now has remote debugging on. Call use_my_chrome() to switch to it (with its tabs and '
+					"logins); that closes this server's temp Chromium and the pages open in it."
+				)
 		if self._browser is None:
 			with self._attach_lock:
 				if self._browser is None and (why := _no_chrome_here()):
@@ -681,6 +830,56 @@ class CLIMCPServer:
 		# another thread's fallback (a cell the client gave up on) could not start and went back to the user's Chrome
 		return self._attach()
 
+	def _user_chrome_back(self) -> bool:
+		"""--cli-mcp runs its own Chromium because the user's Chrome could not be used, and that Chrome now has remote
+		debugging on: a live DevToolsActivePort, checked with a port connect, not CDP (no Allow prompt)."""
+		if self._own_browser or self._browser is None or self._fallback is None:
+			return False
+		from browser_use.browser import local
+
+		return bool(local.live_debug_dirs())
+
+	def _own_pages(self) -> list[str]:
+		"""The real pages open in this server's own Chromium (blank and browser-internal tabs left out)."""
+		from browser_use.browser.browser import BLANK_OR_INTERNAL, _daemon_cdp
+
+		browser = self._browser
+		if browser is None or not self._own_started or not browser.name:
+			return []
+		try:
+			targets = _daemon_cdp(browser.name, 'Target.getTargets')['targetInfos']
+		except Exception:  # its daemon is gone: nothing to keep
+			return []
+		return [t['url'] for t in targets if t['type'] == 'page' and not t['url'].startswith(BLANK_OR_INTERNAL)]
+
+	def _leave_own(self) -> None:
+		"""Close this server's own Chromium and attach the user's Chrome under the daemon name it had before."""
+		with self._attach_lock:
+			browser, self._browser, self._fallback = self._browser, None, None
+			started, self._own_started, self._hinted = self._own_started, False, False
+		if browser is not None and started:
+			try:
+				asyncio.run(browser.stop())
+			except Exception:  # already gone: the user's Chrome is attached either way
+				pass
+		harness_cloud.route(self._base, self._namespace)
+		self._switched = True
+		harness_cloud.ensure_daemon()
+
+	def _use_my_chrome(self) -> str:
+		"""use_my_chrome(): switch from this server's temp Chromium to the user's own Chrome (its tabs and logins). The
+		temp Chromium closes with the pages open in it."""
+		if self._cloud_started:
+			raise RuntimeError('A cloud browser is in use: stop_remote_daemon() first, then use_my_chrome().')
+		if self._browser is None:
+			return 'Already on your own Chrome.'
+		if not self._user_chrome_back():
+			raise RuntimeError(f'Your Chrome is not ready yet: {self._fallback or CHROME_SETUP}.')
+		self._leave_own()
+		self._switched = False
+		self._announced = 'Browser: your own Chrome (its tabs and logins).'
+		return 'Switched to your own Chrome (its tabs and logins); the temp Chromium is closed.'
+
 	async def _start_own(self, browser: Browser) -> dict[str, str]:
 		"""browser.start(); on a machine with no browser and no display (a server, a container), installs Playwright's
 		Chromium first (once). Never on a desktop: 150 MB inside one tool call the user did not ask for."""
@@ -709,6 +908,9 @@ class CLIMCPServer:
 
 			note = 'Browser: your own Chrome (its tabs and logins).'
 			note = note if admin._is_local_chrome_mode() else 'Browser: the Chrome at BU_CDP_URL / BU_CDP_WS.'
+			if self._switched:  # announced even when this Chrome was named before the fallback
+				self._switched, self._announced = False, None
+				note = note.removesuffix('.') + "; switched from this server's temp Chromium."
 		else:
 			note = "Browser: this server's own Chromium on a temp profile, not your Chrome"
 			note += f' ({self._fallback}).' if self._fallback else '.'
@@ -744,14 +946,14 @@ class CLIMCPServer:
 			)
 		return browser
 
-	def _execute(self, code: str, connect: bool = True) -> tuple[str, bool]:
+	def _execute(self, code: str, connect: bool = True, buffer: StringIO | None = None) -> tuple[str, bool]:
 		"""Run code in the persistent namespace, capturing stdout/stderr. Returns (output, whether it failed): a
 		failure is the tool result's is_error, not only a traceback in its text.
 
 		Runs in a worker thread: harness helpers are synchronous socket IPC. Output is
 		captured because stdout carries the MCP protocol.
 		"""
-		buffer, failed = StringIO(), True
+		buffer, failed = StringIO() if buffer is None else buffer, True
 		with _capture(buffer):
 			try:
 				ns = self._ensure_namespace()
@@ -787,6 +989,7 @@ class CLIMCPServer:
 		"""One line for a failure to reach the browser. browser-harness's "daemon <name> didn't come up -- check <log>"
 		named only a log file the model cannot read: its last line is the reason (browser-harness reads it the same way)."""
 		if isinstance(e, CloudAuthRequired):  # its own message names `browser-harness auth login`, not this server's tool
+			record_auth_event('missing_key', key_gate='mcp_cloud', key_reason='missing', entry='mcp')
 			return LOGIN_HINT
 		if isinstance(e, CloudBrowserError | NoBrowserError):
 			return f'Error: {e}'
@@ -800,8 +1003,9 @@ class CLIMCPServer:
 			text += f'. No local Chrome to use? {hint[0].upper()}{hint[1:]}'
 		return f'Error: {text}'
 
-	def _sign_in(self, force: bool, wait: float = LOGIN_WAIT_SECONDS) -> str:
-		"""Start (or keep waiting on) one browser login. The key never appears in the result."""
+	def _sign_in(self, force: bool, wait: float = LOGIN_WAIT_SECONDS) -> tuple[str, str]:
+		"""Start (or keep waiting on) one browser login: (the text, how it stands). The key never appears in the text.
+		The state is mcp_server_event login_state; failed and start_failed are error results."""
 		from browser_harness import auth
 
 		with self._login_lock:
@@ -815,14 +1019,17 @@ class CLIMCPServer:
 					status = {'status': 'error', 'reason': str(e)}
 				if status.get('source') == 'env':
 					if not force:
-						return f'Signed in to Browser Use Cloud (key from BROWSER_USE_API_KEY). {LOGIN_NEXT}'
-					return 'BROWSER_USE_API_KEY is set for this server and wins over a stored key: fix or unset it in the MCP config.'
+						return f'Signed in to Browser Use Cloud (key from BROWSER_USE_API_KEY). {LOGIN_NEXT}', 'env'
+					return (
+						'BROWSER_USE_API_KEY is set for this server and wins over a stored key: fix or unset it in the MCP config.',
+						'env',
+					)
 				if status.get('status') == 'authenticated' and not force:
-					return f'Signed in to Browser Use Cloud (key from {status.get("path")}). {LOGIN_NEXT}'
+					return f'Signed in to Browser Use Cloud (key from {status.get("path")}). {LOGIN_NEXT}', 'already'
 				try:
 					login = self._login = _Login()
 				except Exception as e:  # network error, auth server refused the request
-					return f'Could not start Browser Use Cloud login: {e}'
+					return f'Could not start Browser Use Cloud login: {e}', 'start_failed'
 		login.thread.join(wait)
 		if login.thread.is_alive():
 			how = 'in the browser tab that just opened' if login.opened else 'by opening this URL in a browser'
@@ -830,13 +1037,13 @@ class CLIMCPServer:
 				f'Waiting for the user to approve Browser Use {how}: {login.start.auth_url}\n'
 				'Call browser_login again after approving. No browser on this machine? Run `browser-use login --device-code` '
 				'in a terminal instead.'
-			)
+			), 'waiting'
 		with self._login_lock:
 			if self._login is login:
 				self._login = None
 		if login.error:
-			return f'Browser Use Cloud login failed: {login.error}. Call browser_login to try again.'
-		return f'Signed in to Browser Use Cloud. {LOGIN_NEXT}'
+			return f'Browser Use Cloud login failed: {login.error}. Call browser_login to try again.', 'failed'
+		return f'Signed in to Browser Use Cloud. {LOGIN_NEXT}', 'signed_in'
 
 	def _screenshot(self, full: bool, max_dim: int | None) -> str:
 		buffer = StringIO()
@@ -888,6 +1095,7 @@ class CLIMCPServer:
 
 
 async def main(own_browser: bool = False, **browser_options: Any):
+	set_entry('mcp')  # library_auth entry: a key the server's own browser start finds missing
 	os.environ.setdefault('BH_CLIENT', 'browser-use-mcp')
 	os.environ['BU_MODEL_CODE'] = '1'  # browser_exec runs the client model's code: its browser_use.feedback() is not consent
 	server = CLIMCPServer(own_browser, **browser_options)
